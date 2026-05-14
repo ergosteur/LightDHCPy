@@ -33,6 +33,13 @@ Disclaimer:
     educational/experimental tool and is NOT intended for production use. It 
     was designed strictly for use in isolated lab or network testing environments. 
     
+    IMPORTANT: To ensure cross-platform compatibility with UDP broadcasts, this 
+    server binds to ALL interfaces (0.0.0.0:67). It WILL respond to DHCP 
+    requests on networks you may not intend to serve. You MUST use your host 
+    operating system's firewall (iptables, Windows Firewall, ufw, etc.) to block 
+    UDP port 67 on any interfaces where you do not want this server to act as a 
+    DHCP server.
+    
     Running a DHCP server on a network that already has an active DHCP server 
     (like your home router or corporate network) can cause a "Rogue DHCP" 
     scenario, resulting in IP conflicts and severe network outages. Use with 
@@ -77,6 +84,9 @@ WEB_UI_HTML = """
         .refresh-btn { background-color: #3498db; color: white; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer; font-size: 14px; transition: background 0.2s;}
         .refresh-btn:hover { background-color: #2980b9; }
         
+        .alert-warning { background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 6px; border: 1px solid #ffeeba; margin-bottom: 20px; font-size: 14px; line-height: 1.5; }
+        .alert-warning strong { font-weight: 600; }
+        
         /* Modal & Editor Styles */
         .btn-warning { background-color: #f39c12; color: white; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer; font-size: 14px; transition: background 0.2s; }
         .btn-warning:hover { background-color: #e67e22; }
@@ -101,6 +111,10 @@ WEB_UI_HTML = """
                 <button class="refresh-btn" onclick="fetchStatus()">Refresh Data</button>
             </div>
         </h1>
+        
+        <div class="alert-warning">
+            <strong>⚠️ Security Warning:</strong> To ensure cross-platform compatibility, this DHCP server binds to <strong>all network interfaces (0.0.0.0)</strong>. It will receive and may respond to DHCP requests on networks you did not intend to serve. Please use your OS firewall to block UDP port 67 on interfaces you want to exclude.
+        </div>
         
         <div class="card grid">
             <div class="stat-box">
@@ -396,7 +410,7 @@ class MinimalDHCPServer:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        # Bind to all interfaces on port 67
+        # Bind to all interfaces on port 67 (required for cross-platform broadcast reception)
         self.sock.bind(('0.0.0.0', 67))
         self.sock.settimeout(1.0) # Set a timeout so the while loop can check for expirations
 
@@ -576,6 +590,9 @@ class MinimalDHCPServer:
             logging.info(f"Static Leases configured: {len(self.static_leases)}")
         if self.boot_file:
             logging.info(f"PXE Booting enabled: Next Server {self.next_server}, File '{self.boot_file}'")
+            
+        logging.warning("SECURITY WARNING: Server is binding to 0.0.0.0 (all interfaces).")
+        logging.warning("Please use your OS firewall to block UDP Port 67 on unintended interfaces.")
         logging.info("Listening for DHCP requests on UDP Port 67...\n")
 
         try:
