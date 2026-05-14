@@ -12,6 +12,7 @@ Description:
 Features:
     - No external dependencies (uses only Python's standard library).
     - Built-in Web UI Dashboard for real-time lease monitoring.
+    - Basic Authentication for the Web UI (default: admin:admin).
     - In-browser JSON configuration editor with hot-reloading.
     - Interactive `--quickstart` wizard for instant setup.
     - Supports PXE booting, static leases, and custom DHCP options.
@@ -58,6 +59,7 @@ import os
 import sys
 import threading
 import http.server
+import base64
 
 WEB_UI_HTML = """
 <!DOCTYPE html>
@@ -85,7 +87,6 @@ WEB_UI_HTML = """
         .refresh-btn:hover { background-color: #2980b9; }
         
         .alert-warning { background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 6px; border: 1px solid #ffeeba; margin-bottom: 20px; font-size: 14px; line-height: 1.5; }
-        .alert-warning strong { font-weight: 600; }
         
         /* Modal & Editor Styles */
         .btn-warning { background-color: #f39c12; color: white; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer; font-size: 14px; transition: background 0.2s; }
@@ -97,9 +98,15 @@ WEB_UI_HTML = """
         .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; line-height: 20px;}
         .close:hover { color: #333; }
         textarea.config-area { width: 100%; height: 400px; font-family: monospace; padding: 12px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; resize: vertical; font-size: 14px; background: #f8f9fa; }
+        
         #restarting-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255,255,255,0.95); z-index: 2000; justify-content: center; align-items: center; flex-direction: column; font-size: 24px; color: #333;}
         .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin-bottom: 20px;}
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* Custom Notification */
+        #notification-box { display: none; padding: 15px; margin-bottom: 15px; border-radius: 4px; color: white; font-weight: bold; }
+        .notif-error { background-color: #e74c3c; }
+        .notif-success { background-color: #2ecc71; }
     </style>
 </head>
 <body>
@@ -112,8 +119,10 @@ WEB_UI_HTML = """
             </div>
         </h1>
         
+        <div id="notification-box"></div>
+
         <div class="alert-warning">
-            <strong>⚠️ Security Warning:</strong> To ensure cross-platform compatibility, this DHCP server binds to <strong>all network interfaces (0.0.0.0)</strong>. It will receive and may respond to DHCP requests on networks you did not intend to serve. Please use your OS firewall to block UDP port 67 on interfaces you want to exclude.
+            <strong>⚠️ Security Warning:</strong> Bound to <strong>0.0.0.0</strong>. Use OS firewall to block UDP port 67 on excluded interfaces.
         </div>
         
         <div class="card grid">
@@ -156,7 +165,8 @@ WEB_UI_HTML = """
         <div class="modal-content">
             <span class="close" onclick="closeConfigEditor()">&times;</span>
             <h2 style="margin-top: 0; color: #2c3e50;">Edit Configuration (config.json)</h2>
-            <p style="color: #666; font-size: 14px; margin-bottom: 15px;">Warning: Syntax errors may prevent the server from successfully restarting.</p>
+            <div id="modal-notification" style="display:none; padding:10px; margin-bottom:10px; border-radius:4px; background:#e74c3c; color:white;"></div>
+            <p style="color: #666; font-size: 14px; margin-bottom: 15px;">Saving will trigger a hot-reload of the DHCP server process.</p>
             <textarea id="config-text" class="config-area"></textarea>
             <div style="text-align: right;">
                 <button class="btn-success" onclick="saveAndReload()">Save & Restart Server</button>
@@ -172,9 +182,23 @@ WEB_UI_HTML = """
     </div>
 
     <script>
+        function showNotification(message, isError = false, targetId = 'notification-box') {
+            const box = document.getElementById(targetId);
+            box.style.display = 'block';
+            box.innerText = message;
+            box.className = isError ? 'notif-error' : 'notif-success';
+            setTimeout(() => { box.style.display = 'none'; }, 5000);
+        }
+
         function fetchStatus() {
             fetch('/api/status')
-                .then(response => response.json())
+                .then(response => {
+                    if(response.status === 401) {
+                        showNotification("Authentication required. Please refresh and login.", true);
+                        throw new Error("Unauthorized");
+                    }
+                    return response.json()
+                })
                 .then(data => {
                     document.getElementById('info-ip').innerText = data.config.server_ip;
                     document.getElementById('info-subnet').innerText = data.config.subnet;
@@ -229,8 +253,9 @@ WEB_UI_HTML = """
                 .then(data => {
                     document.getElementById('config-text').value = JSON.stringify(data, null, 4);
                     document.getElementById('configModal').style.display = 'block';
+                    document.getElementById('modal-notification').style.display = 'none';
                 })
-                .catch(err => alert("Error fetching config: " + err));
+                .catch(err => showNotification("Error fetching config: " + err, true));
         }
 
         function closeConfigEditor() {
@@ -240,59 +265,88 @@ WEB_UI_HTML = """
         function saveAndReload() {
             const rawText = document.getElementById('config-text').value;
             try {
-                JSON.parse(rawText); // Validate JSON locally before sending
+                JSON.parse(rawText);
             } catch (e) {
-                alert("Invalid JSON format:\\n" + e.message);
+                showNotification("Invalid JSON format: " + e.message, true, 'modal-notification');
                 return;
             }
-
-            if(!confirm("Saving will immediately restart the DHCP server. Continue?")) return;
 
             fetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: rawText
             })
-            .then(res => {
-                if (!res.ok) throw new Error("Failed to save configuration.");
-                return res.json();
+            .then(async res => {
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || "Failed to save configuration.");
+                return data;
             })
             .then(() => {
                 closeConfigEditor();
                 document.getElementById('restarting-overlay').style.display = 'flex';
                 
-                // Poll every second to see if server is back online
                 let attempts = 0;
                 const pollInterval = setInterval(() => {
                     attempts++;
                     fetch('/api/status')
                         .then(res => {
-                            if (res.ok) {
+                            if (res.ok || res.status === 401) {
                                 clearInterval(pollInterval);
-                                window.location.reload(); // Server is back, refresh page!
+                                window.location.reload(); 
                             }
                         })
                         .catch(() => {
                             if (attempts > 15) {
                                 clearInterval(pollInterval);
-                                alert("Server did not respond after 15 seconds. It may have crashed due to invalid configuration. Please check server console logs.");
+                                showNotification("Server offline. It may have crashed due to invalid config. Check console logs.", true);
                                 document.getElementById('restarting-overlay').style.display = 'none';
                             }
                         });
                 }, 1000);
             })
-            .catch(err => alert(err.message));
+            .catch(err => showNotification(err.message, true, 'modal-notification'));
         }
 
         fetchStatus();
-        setInterval(fetchStatus, 10000); // Auto-refresh every 10 seconds
+        setInterval(fetchStatus, 5000); 
     </script>
 </body>
 </html>
 """
 
 class WebUIHandler(http.server.BaseHTTPRequestHandler):
+    
+    def check_auth(self):
+        # Basic Auth implementation
+        expected_user = self.server.dhcp_server.web_user
+        expected_pass = self.server.dhcp_server.web_pass
+        
+        if not expected_user:
+            return True # Auth disabled
+            
+        auth_header = self.headers.get('Authorization')
+        if auth_header:
+            auth_type, encoded_creds = auth_header.split(' ', 1)
+            if auth_type.lower() == 'basic':
+                try:
+                    decoded = base64.b64decode(encoded_creds).decode('utf-8')
+                    user, pwd = decoded.split(':', 1)
+                    if user == expected_user and pwd == expected_pass:
+                        return True
+                except Exception:
+                    pass
+                    
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="LightDHCPy Dashboard"')
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b'Unauthorized')
+        return False
+
     def do_GET(self):
+        if not self.check_auth():
+            return
+            
         if self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
@@ -318,19 +372,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            
             dhcp = self.server.dhcp_server
-            
-            # Always send the fully resolved active config. This ensures that CLI 
-            # arguments (like --web-port) are populated in the editor and saved 
-            # to the file, so they aren't lost during the restart process.
             config_str = json.dumps(dhcp.current_config_dict, indent=4)
-                
             self.wfile.write(config_str.encode('utf-8'))
         else:
             self.send_error(404)
 
     def do_POST(self):
+        if not self.check_auth():
+            return
+            
         if self.path == '/api/config':
             dhcp = self.server.dhcp_server
             content_length = int(self.headers.get('Content-Length', 0))
@@ -338,6 +389,20 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             
             try:
                 new_config = json.loads(post_data)
+                
+                # Validation Step to prevent boot loops
+                try:
+                    ipaddress.IPv4Address(new_config.get('server_ip'))
+                    ipaddress.IPv4Address(new_config.get('start'))
+                    ipaddress.IPv4Address(new_config.get('end'))
+                    ipaddress.IPv4Address(new_config.get('subnet'))
+                except ValueError as ve:
+                    self.send_response(400)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": f"Invalid IP format in config: {ve}"}).encode('utf-8'))
+                    return
+                
                 save_path = dhcp.config_file or "config.json"
                 
                 with open(save_path, 'w') as f:
@@ -348,7 +413,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"status": "ok"}')
                 
-                # Signal the main thread to reload
+                # Signal reload
                 dhcp.needs_reload = True
                 dhcp.reload_config_path = save_path
                 
@@ -366,10 +431,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def log_message(self, format, *args):
-        # Mute standard HTTP server logs to keep console clean, unless in debug mode
         logging.debug(f"WebUI: {self.client_address[0]} - {format % args}")
 
-# Custom HTTPServer that allows address reuse immediately upon restart
 class ReuseHTTPServer(http.server.HTTPServer):
     allow_reuse_address = True
 
@@ -377,11 +440,13 @@ def run_web_ui(dhcp_server, port):
     server_address = ('0.0.0.0', port)
     httpd = ReuseHTTPServer(server_address, WebUIHandler)
     httpd.dhcp_server = dhcp_server
-    logging.info(f"Web UI dashboard started on http://0.0.0.0:{port}")
+    logging.info(f"Web UI started on http://0.0.0.0:{port}")
+    if dhcp_server.web_user:
+        logging.info(f"Web UI Auth -> User: {dhcp_server.web_user} (Password is set)")
     httpd.serve_forever()
 
 class MinimalDHCPServer:
-    def __init__(self, interface_ip, start_ip, end_ip, subnet, gateway=None, dns=None, lease_file="leases.json", static_leases=None, next_server=None, boot_file=None, custom_options=None):
+    def __init__(self, interface_ip, start_ip, end_ip, subnet, gateway=None, dns=None, lease_file="leases.json", static_leases=None, next_server=None, boot_file=None, custom_options=None, web_user="admin", web_pass="admin"):
         self.server_ip = interface_ip
         self.subnet = subnet
         self.gateway = gateway
@@ -392,78 +457,74 @@ class MinimalDHCPServer:
         self.next_server = next_server or '0.0.0.0'
         self.boot_file = boot_file or ''
         self.custom_options = custom_options or []
+        self.web_user = web_user
+        self.web_pass = web_pass
         
-        # Calculate the directed broadcast address for the subnet
+        self.last_disk_save = 0  # Debounce timer
+        
         net = ipaddress.IPv4Network(f"{self.server_ip}/{self.subnet}", strict=False)
         self.broadcast_ip = str(net.broadcast_address)
         
-        # Generate the pool of available IP addresses
         start = int(ipaddress.IPv4Address(start_ip))
         end = int(ipaddress.IPv4Address(end_ip))
         self.ip_pool = [str(ipaddress.IPv4Address(i)) for i in range(start, end + 1)]
         
-        # Dictionary to keep track of leases: { MAC_ADDRESS: {'ip': IP, 'expires': TIMESTAMP} }
         self.leases = {}
         self.load_leases()
         
-        # Setup UDP Socket for DHCP (Listening on Port 67)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        # Bind to all interfaces on port 67 (required for cross-platform broadcast reception)
         self.sock.bind(('0.0.0.0', 67))
-        self.sock.settimeout(1.0) # Set a timeout so the while loop can check for expirations
+        self.sock.settimeout(1.0) 
 
     def load_leases(self):
-        """Load existing leases from disk to persist state across reboots."""
         if os.path.exists(self.lease_file):
             try:
                 with open(self.lease_file, 'r') as f:
                     self.leases = json.load(f)
-                # Remove loaded IPs from the available pool
                 for mac, data in self.leases.items():
                     if data['ip'] in self.ip_pool:
                         self.ip_pool.remove(data['ip'])
-                logging.info(f"Loaded {len(self.leases)} active leases from {self.lease_file}")
+                logging.info(f"Loaded {len(self.leases)} active leases")
             except Exception as e:
                 logging.error(f"Failed to load leases: {e}")
 
-    def save_leases(self):
-        """Save active leases to disk."""
-        try:
-            with open(self.lease_file, 'w') as f:
-                json.dump(self.leases, f, indent=4)
-        except Exception as e:
-            logging.error(f"Failed to save leases: {e}")
+    def save_leases(self, force=False):
+        """Save leases with debounce to avoid disk thrashing during DHCP storms"""
+        now = time.time()
+        if force or (now - self.last_disk_save > 5):
+            try:
+                with open(self.lease_file, 'w') as f:
+                    json.dump(self.leases, f, indent=4)
+                self.last_disk_save = now
+            except Exception as e:
+                logging.error(f"Failed to save leases: {e}")
 
     def clean_expired_leases(self):
-        """Check for and remove expired leases, returning IPs to the pool."""
         now = time.time()
         expired_macs = []
         for mac, data in self.leases.items():
             if mac in self.static_leases:
-                continue # Static leases do not expire
+                continue 
             if data['expires'] < now:
                 expired_macs.append(mac)
         
         for mac in expired_macs:
             ip = self.leases.pop(mac)['ip']
             self.ip_pool.append(ip)
-            logging.info(f"[*] Lease for {mac} ({ip}) expired and was returned to pool.")
+            logging.info(f"[*] Lease for {mac} ({ip}) expired")
         
         if expired_macs:
-            self.save_leases()
+            self.save_leases(force=True)
 
     def get_ip_for_mac(self, mac_hex, options=None):
-        """Allocate an IP from the pool or return an existing lease."""
         options = options or {}
         hostname = options.get('hostname', '')
         vendor_class = options.get('vendor_class', '')
 
-        # 1. Check static leases
         if mac_hex in self.static_leases:
             ip = self.static_leases[mac_hex]
-            # Update the lease info (in case hostname changed)
             self.leases[mac_hex] = {
                 'ip': ip, 
                 'expires': time.time() + self.lease_time,
@@ -473,17 +534,13 @@ class MinimalDHCPServer:
             self.save_leases()
             return ip
 
-        # 2. Check existing dynamic leases
         if mac_hex in self.leases:
-            self.leases[mac_hex]['expires'] = time.time() + self.lease_time # Renew lease time
-            if hostname:
-                self.leases[mac_hex]['hostname'] = hostname
-            if vendor_class:
-                self.leases[mac_hex]['vendor_class'] = vendor_class
+            self.leases[mac_hex]['expires'] = time.time() + self.lease_time 
+            if hostname: self.leases[mac_hex]['hostname'] = hostname
+            if vendor_class: self.leases[mac_hex]['vendor_class'] = vendor_class
             self.save_leases()
             return self.leases[mac_hex]['ip']
             
-        # 3. Pull from pool
         if not self.ip_pool:
             logging.warning("[-] No more IP addresses available in the pool.")
             return None
@@ -499,83 +556,60 @@ class MinimalDHCPServer:
         return ip
 
     def parse_options(self, options_data):
-        """Extract DHCP options from the packet."""
         options = {}
         i = 0
         while i < len(options_data):
             tag = options_data[i]
-            if tag == 255: # End of options
-                break
-            if tag == 0:   # Padding
+            if tag == 255: break
+            if tag == 0:
                 i += 1
                 continue
             
             length = options_data[i+1]
             value = options_data[i+2 : i+2+length]
             
-            if tag == 53:   # DHCP Message Type
-                options['msg_type'] = value[0]
-            elif tag == 50: # Requested IP Address
-                options['req_ip'] = socket.inet_ntoa(value)
-            elif tag == 12: # Hostname
-                options['hostname'] = value.decode('utf-8', errors='ignore')
-            elif tag == 60: # Vendor Class Identifier
-                options['vendor_class'] = value.decode('utf-8', errors='ignore')
+            if tag == 53: options['msg_type'] = value[0]
+            elif tag == 50: options['req_ip'] = socket.inet_ntoa(value)
+            elif tag == 12: options['hostname'] = value.decode('utf-8', errors='ignore')
+            elif tag == 60: options['vendor_class'] = value.decode('utf-8', errors='ignore')
                 
             i += 2 + length
         return options
 
     def build_packet(self, xid, mac_padded, yiaddr, msg_type, flags):
-        """Construct the DHCP response packet."""
         packet = b''
-        packet += b'\x02'          # OP: 2 (Boot Reply)
-        packet += b'\x01'          # HTYPE: 1 (Ethernet)
-        packet += b'\x06'          # HLEN: 6 (MAC length)
-        packet += b'\x00'          # HOPS: 0
-        packet += xid              # XID (Transaction ID)
-        packet += b'\x00\x00'      # SECS: 0
-        packet += flags            # FLAGS: Mirrored from client
-        packet += b'\x00\x00\x00\x00' # CIADDR: Client IP (0.0.0.0)
-        packet += socket.inet_aton(yiaddr) # YIADDR: Your IP
-        packet += socket.inet_aton(self.next_server) # SIADDR: Next Server IP (for PXE)
-        packet += b'\x00\x00\x00\x00' # GIADDR: Gateway IP (0.0.0.0)
-        packet += mac_padded       # CHADDR: Client MAC Address + Padding (16 bytes)
-        packet += b'\x00' * 64     # SNAME: Server Name (Empty)
+        packet += b'\x02\x01\x06\x00'
+        packet += xid              
+        packet += b'\x00\x00'      
+        packet += flags            
+        packet += b'\x00\x00\x00\x00' 
+        packet += socket.inet_aton(yiaddr) 
+        packet += socket.inet_aton(self.next_server) 
+        packet += b'\x00\x00\x00\x00' 
+        packet += mac_padded       
+        packet += b'\x00' * 64     
         
-        # FILE: Boot File Name (128 bytes - useful for PXE)
         boot_file_bytes = self.boot_file.encode('utf-8')
         if len(boot_file_bytes) < 128:
             boot_file_bytes += b'\x00' * (128 - len(boot_file_bytes))
         packet += boot_file_bytes[:128]
         
-        packet += b'\x63\x82\x53\x63' # Magic Cookie: DHCP
+        packet += b'\x63\x82\x53\x63' 
         
-        # DHCP Options
-        # Option 53: Message Type (1 byte)
         packet += b'\x35\x01' + bytes([msg_type])
-        # Option 54: Server Identifier (4 bytes)
         packet += b'\x36\x04' + socket.inet_aton(self.server_ip)
-        # Option 51: IP Lease Time (4 bytes)
         packet += b'\x33\x04' + struct.pack("!I", self.lease_time)
-        # Option 1: Subnet Mask (4 bytes)
         packet += b'\x01\x04' + socket.inet_aton(self.subnet)
         
-        # Option 3: Gateway (Router) (4 bytes)
         if self.gateway:
             packet += b'\x03\x04' + socket.inet_aton(self.gateway)
-            
-        # Option 6: Domain Name Server (4 bytes)
         if self.dns:
             packet += b'\x06\x04' + socket.inet_aton(self.dns)
             
-        # Custom DHCP Options
         for code, raw_bytes in self.custom_options:
             packet += bytes([code, len(raw_bytes)]) + raw_bytes
             
-        # Option 255: End
         packet += b'\xff'
-        
-        # Pad to meet minimum BOOTP frame size
         if len(packet) < 300:
             packet += b'\x00' * (300 - len(packet))
             
@@ -585,38 +619,22 @@ class MinimalDHCPServer:
         logging.info("LightDHCPy Server started.")
         logging.info(f"Server IP: {self.server_ip}")
         logging.info(f"Pool: {self.ip_pool[0]} - {self.ip_pool[-1] if self.ip_pool else 'Empty'}")
-        logging.info(f"Subnet: {self.subnet} | Gateway: {self.gateway} | DNS: {self.dns}")
-        if self.static_leases:
-            logging.info(f"Static Leases configured: {len(self.static_leases)}")
-        if self.boot_file:
-            logging.info(f"PXE Booting enabled: Next Server {self.next_server}, File '{self.boot_file}'")
-            
-        logging.warning("SECURITY WARNING: Server is binding to 0.0.0.0 (all interfaces).")
-        logging.warning("Please use your OS firewall to block UDP Port 67 on unintended interfaces.")
-        logging.info("Listening for DHCP requests on UDP Port 67...\n")
-
+        
         try:
             while True:
                 if getattr(self, 'needs_reload', False):
                     logging.info("[*] Reload requested via Web UI. Restarting server...")
                     break
 
-                # 1. Clean up expired leases on loop cycle
                 self.clean_expired_leases()
                 
                 try:
                     data, addr = self.sock.recvfrom(1024)
                 except socket.timeout:
-                    # Timeout allows us to loop back and run clean_expired_leases() when idle
                     continue
                 
-                # Minimum DHCP packet size is 240 bytes (header + magic cookie)
-                if len(data) < 240:
-                    continue
-                    
-                op = data[0]
-                if op != 1: # Ignore if not a BootRequest (OP=1)
-                    continue
+                if len(data) < 240: continue
+                if data[0] != 1: continue
 
                 xid = data[4:8]
                 flags = data[10:12]
@@ -627,20 +645,17 @@ class MinimalDHCPServer:
                 options = self.parse_options(data[240:])
                 msg_type = options.get('msg_type')
 
-                if msg_type == 1: # DHCP DISCOVER
-                    logging.info(f"[>] DHCP DISCOVER received from {mac_hex}")
+                if msg_type == 1: 
+                    logging.info(f"[>] DHCP DISCOVER from {mac_hex}")
                     ip = self.get_ip_for_mac(mac_hex, options)
                     if ip:
-                        # Send DHCP OFFER (Msg Type 2)
                         reply = self.build_packet(xid, mac_padded, ip, 2, flags)
                         self.sock.sendto(reply, (self.broadcast_ip, 68))
-                        logging.info(f"[<] DHCP OFFER sent to {mac_hex} offering {ip}")
+                        logging.info(f"[<] DHCP OFFER {ip} to {mac_hex}")
 
-                elif msg_type == 3: # DHCP REQUEST
-                    logging.info(f"[>] DHCP REQUEST received from {mac_hex}")
+                elif msg_type == 3: 
+                    logging.info(f"[>] DHCP REQUEST from {mac_hex}")
                     req_ip = options.get('req_ip')
-                    
-                    # If client is renewing, the requested IP might be in the CIADDR field
                     ciaddr = socket.inet_ntoa(data[12:16])
                     if not req_ip and ciaddr != '0.0.0.0':
                         req_ip = ciaddr
@@ -648,45 +663,37 @@ class MinimalDHCPServer:
                     ip = self.get_ip_for_mac(mac_hex, options)
                     
                     if ip and (req_ip == ip or req_ip is None):
-                        # Send DHCP ACK (Msg Type 5)
                         reply = self.build_packet(xid, mac_padded, ip, 5, flags)
                         self.sock.sendto(reply, (self.broadcast_ip, 68))
-                        logging.info(f"[<] DHCP ACK sent to {mac_hex} acknowledging {ip}")
+                        logging.info(f"[<] DHCP ACK {ip} to {mac_hex}")
                     else:
-                        # Send DHCP NAK (Msg Type 6) to reject invalid/old IP requests
                         reply = self.build_packet(xid, mac_padded, '0.0.0.0', 6, flags)
                         self.sock.sendto(reply, (self.broadcast_ip, 68))
-                        logging.info(f"[<] DHCP NAK sent to {mac_hex} rejecting {req_ip}")
+                        logging.info(f"[<] DHCP NAK sent to {mac_hex}")
 
-                elif msg_type == 7: # DHCP RELEASE
-                    logging.info(f"[>] DHCP RELEASE received from {mac_hex}")
+                elif msg_type == 7: 
+                    logging.info(f"[>] DHCP RELEASE from {mac_hex}")
                     if mac_hex in self.leases:
                         rel_ip = self.leases.pop(mac_hex)['ip']
                         if rel_ip not in self.static_leases.values():
                             self.ip_pool.append(rel_ip)
-                        self.save_leases()
-                        logging.info(f"[*] Released IP {rel_ip} and returned to pool.")
+                        self.save_leases(force=True)
+                        logging.info(f"[*] Released IP {rel_ip}")
                         
         except KeyboardInterrupt:
             logging.info("\n[*] Shutting down DHCP server.")
         finally:
-            self.save_leases()
+            self.save_leases(force=True)
             self.sock.close()
             
-        # Perform the actual process replacement after cleaning up sockets
         if getattr(self, 'needs_reload', False):
             config_path = getattr(self, 'reload_config_path', 'config.json')
-            
-            # We construct a completely new argument list using ONLY the saved config file. 
-            # This ensures CLI arguments don't override the UI config edits.
             exec_args = [sys.argv[0], '-c', config_path]
-            logging.info(f"[*] Executing: {sys.executable} {' '.join(exec_args)}")
-            
             os.execv(sys.executable, [sys.executable] + exec_args)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LightDHCPy - The Lightweight Python DHCP Server")
+    parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", help="Path to a JSON configuration file")
     parser.add_argument("--server-ip", help="The IP address of the interface running this server")
     parser.add_argument("--start", help="Start of the IP pool (e.g., 192.168.1.100)")
@@ -694,15 +701,17 @@ if __name__ == "__main__":
     parser.add_argument("--subnet", help="Subnet mask (e.g., 255.255.255.0)")
     parser.add_argument("--gateway", help="Default gateway IP (optional)")
     parser.add_argument("--dns", help="DNS server IP (optional)")
-    parser.add_argument("--lease-file", help="File to persist leases (default: leases.json)")
-    parser.add_argument("--static", action="append", help="Static lease in format MAC=IP (e.g., 08:00:27:aa:68:c9=10.73.37.50)")
-    parser.add_argument("--next-server", help="PXE Next Server IP (SIADDR)")
+    parser.add_argument("--lease-file", help="File to persist leases")
+    parser.add_argument("--static", action="append", help="Static lease MAC=IP")
+    parser.add_argument("--next-server", help="PXE Next Server IP")
     parser.add_argument("--boot-file", help="PXE Boot File Name")
-    parser.add_argument("--option", action="append", help="Custom DHCP option CODE:TYPE:VALUE. Examples: 15:string:local.lan (Domain Name), 42:ips:10.0.0.2,10.0.0.3 (NTP Servers), 43:hex:010203 (Vendor Specific)")
-    parser.add_argument("--web-port", type=int, help="Enable the Web UI dashboard on the specified port (e.g. 8080)")
+    parser.add_argument("--option", action="append", help="Custom DHCP option CODE:TYPE:VALUE")
+    parser.add_argument("--web-port", type=int, help="Enable Web UI on specified port")
+    parser.add_argument("--web-user", default="admin", help="Web UI Username")
+    parser.add_argument("--web-pass", default="admin", help="Web UI Password")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging output")
-    parser.add_argument("--generate-config", metavar="FILE", help="Generate a sample config file based on current CLI args and exit")
-    parser.add_argument("--quickstart", action="store_true", help="Interactive wizard to generate a basic config and start the server")
+    parser.add_argument("--generate-config", metavar="FILE", help="Generate a sample config")
+    parser.add_argument("--quickstart", action="store_true", help="Interactive wizard")
     
     args = parser.parse_args()
 
@@ -716,7 +725,7 @@ if __name__ == "__main__":
                 ipaddress.IPv4Address(server_ip_str)
                 break
             except ValueError:
-                print("[-] Invalid IP address format. Please try again.")
+                print("[-] Invalid IP format.")
 
         octets = server_ip_str.split('.')
         base_ip = f"{octets[0]}.{octets[1]}.{octets[2]}"
@@ -734,90 +743,33 @@ if __name__ == "__main__":
             "lease_file": "leases.json",
             "debug": False,
             "web_port": web_port,
+            "web_user": "admin",
+            "web_pass": "admin",
             "static": {},
             "custom_options": []
         }
 
         config_file = "config.json"
         if os.path.exists(config_file):
-            ans = input(f"[!] '{config_file}' already exists. Overwrite? (y/N): ")
-            if ans.lower() != 'y':
+            if input(f"[!] '{config_file}' exists. Overwrite? (y/N): ").lower() != 'y':
                 config_file = "quickstart_config.json"
-                print(f"[*] Saving to '{config_file}' instead.")
 
         try:
             with open(config_file, 'w') as f:
                 json.dump(quick_config, f, indent=4)
-            print(f"[*] Successfully generated '{config_file}'")
-            # Pass the generated file down to the normal startup logic
             args.config = config_file
         except Exception as e:
-            print(f"[-] Failed to write config: {e}")
-            sys.exit(1)
-        print("=================================================\n")
-
-    # Generate config and exit if requested
-    if args.generate_config:
-        sample_static = {}
-        if args.static:
-            for s in args.static:
-                try:
-                    mac, ip = s.split('=')
-                    sample_static[mac.lower()] = ip
-                except ValueError:
-                    pass
-        if not sample_static:
-            sample_static = {"00:11:22:33:44:55": "192.168.1.50"}
-
-        # Calculate a default .1 gateway address based on the start IP if no gateway is provided
-        start_ip_val = args.start or "192.168.1.100"
-        default_gateway = args.gateway or ('.'.join(start_ip_val.split('.')[:-1]) + '.1')
-
-        sample_config = {
-            "server_ip": args.server_ip or "192.168.1.10",
-            "start": start_ip_val,
-            "end": args.end or "192.168.1.200",
-            "subnet": args.subnet or "255.255.255.0",
-            "gateway": default_gateway,
-            "dns": args.dns or None,
-            "lease_file": args.lease_file or "leases.json",
-            "debug": args.debug,
-            "web_port": args.web_port or 8080,
-            "static": sample_static,
-            "custom_options": args.option or ["15:string:my.lan", "42:ip:192.168.1.10"]
-        }
-        
-        if args.next_server:
-            sample_config["next_server"] = args.next_server
-        if args.boot_file:
-            sample_config["boot_file"] = args.boot_file
-
-        if os.path.exists(args.generate_config):
-            ans = input(f"[!] File '{args.generate_config}' already exists. Overwrite? (y/N): ")
-            if ans.lower() != 'y':
-                print("[-] Config generation aborted.")
-                sys.exit(0)
-
-        try:
-            with open(args.generate_config, 'w') as f:
-                json.dump(sample_config, f, indent=4)
-            print(f"[*] Successfully generated sample configuration at '{args.generate_config}'")
-            sys.exit(0)
-        except Exception as e:
-            print(f"[-] Failed to generate config: {e}")
             sys.exit(1)
 
-    # Load config file if specified
+    # Simplified Config loader for improved readability
     config_data = {}
     if args.config:
         try:
             with open(args.config, 'r') as f:
                 config_data = json.load(f)
         except Exception as e:
-            print(f"Error loading config file {args.config}: {e}")
             sys.exit(1)
 
-    # Helper to resolve arguments (CLI takes precedence over config file)
     def get_val(cli_val, key, default=None):
         return cli_val if cli_val is not None else config_data.get(key, default)
 
@@ -826,96 +778,43 @@ if __name__ == "__main__":
     end_ip = get_val(args.end, 'end')
     subnet = get_val(args.subnet, 'subnet')
 
-    if not all([server_ip, start_ip, end_ip, subnet]):
-        parser.error("Missing required arguments. --server-ip, --start, --end, and --subnet are required (via CLI or config file).")
+    if not all([server_ip, start_ip, end_ip, subnet]) and not args.generate_config:
+        parser.error("Missing required arguments. --server-ip, --start, --end, and --subnet are required.")
 
     gateway = get_val(args.gateway, 'gateway')
     dns = get_val(args.dns, 'dns')
     lease_file = get_val(args.lease_file, 'lease_file', 'leases.json')
     next_server = get_val(args.next_server, 'next_server')
     boot_file = get_val(args.boot_file, 'boot_file')
-    
-    # Debug flag: CLI --debug overrides, else check config
     debug_mode = True if '--debug' in sys.argv else config_data.get('debug', False)
-    
     web_port = get_val(args.web_port, 'web_port')
+    web_user = get_val(args.web_user, 'web_user', 'admin')
+    web_pass = get_val(args.web_pass, 'web_pass', 'admin')
 
-    # Setup Logging
     log_level = logging.DEBUG if debug_mode else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
 
     def parse_custom_option(opt_str):
-        """Parse custom options in format CODE:TYPE:VALUE"""
         try:
             parts = opt_str.split(':', 2)
-            if len(parts) != 3:
-                raise ValueError("Format must be CODE:TYPE:VALUE")
-            
-            code = int(parts[0])
-            if code in (0, 255):
-                raise ValueError("Cannot use padding (0) or end (255) option codes.")
-                
-            otype = parts[1].lower()
-            val = parts[2]
-            
-            if otype == 'string':
-                raw = val.encode('utf-8')
-            elif otype == 'ip':
-                raw = socket.inet_aton(val)
-            elif otype == 'ips':
-                raw = b''.join(socket.inet_aton(ip.strip()) for ip in val.split(','))
-            elif otype == 'hex':
-                raw = bytes.fromhex(val)
-            else:
-                raise ValueError(f"Unknown type '{otype}'. Allowed types: string, ip, ips, hex")
-                
-            if len(raw) > 255:
-                raise ValueError("Option payload exceeds maximum length of 255 bytes.")
-                
+            code, otype, val = int(parts[0]), parts[1].lower(), parts[2]
+            if otype == 'string': raw = val.encode('utf-8')
+            elif otype == 'ip': raw = socket.inet_aton(val)
+            elif otype == 'ips': raw = b''.join(socket.inet_aton(ip.strip()) for ip in val.split(','))
+            elif otype == 'hex': raw = bytes.fromhex(val)
+            else: return None
             return (code, raw)
-        except Exception as e:
-            logging.error(f"Invalid custom option '{opt_str}': {e}")
+        except Exception:
             return None
 
-    # Parse static leases
     static_mappings = {}
-    
-    # 1. From Config File (can be a JSON object like {"MAC": "IP"})
     config_static = config_data.get('static', {})
     if isinstance(config_static, dict):
-        for mac, ip in config_static.items():
-            static_mappings[mac.lower()] = ip
-    elif isinstance(config_static, list): # Support list of "MAC=IP" strings too
-        for s in config_static:
-            try:
-                mac, ip = s.split('=')
-                static_mappings[mac.lower()] = ip
-            except ValueError:
-                logging.error(f"Invalid static lease in config: {s}. Use MAC=IP.")
+        for mac, ip in config_static.items(): static_mappings[mac.lower()] = ip
 
-    # 2. From CLI (Overrides config file)
-    if args.static:
-        for s in args.static:
-            try:
-                mac, ip = s.split('=')
-                static_mappings[mac.lower()] = ip
-            except ValueError:
-                logging.error(f"Invalid static lease in CLI: {s}. Use MAC=IP.")
-
-    # Parse custom DHCP options
     raw_options = config_data.get('custom_options', [])
-    if isinstance(raw_options, str):
-        raw_options = [raw_options]
-    if args.option:
-        raw_options.extend(args.option)
-        
-    parsed_custom_options = []
-    for opt in raw_options:
-        parsed = parse_custom_option(opt)
-        if parsed:
-            parsed_custom_options.append(parsed)
+    parsed_custom_options = [parse_custom_option(opt) for opt in raw_options if parse_custom_option(opt)]
 
-    # Keep track of the resolved config so the Web UI can generate a base config.json if needed
     used_config = {
         "server_ip": server_ip,
         "start": start_ip,
@@ -927,23 +826,23 @@ if __name__ == "__main__":
         "next_server": next_server,
         "boot_file": boot_file,
         "web_port": web_port,
+        "web_user": web_user,
+        "web_pass": web_pass,
         "debug": debug_mode,
         "static": static_mappings,
         "custom_options": raw_options
     }
 
+    if args.generate_config:
+        with open(args.generate_config, 'w') as f:
+            json.dump(used_config, f, indent=4)
+        sys.exit(0)
+
     server = MinimalDHCPServer(
-        interface_ip=server_ip,
-        start_ip=start_ip,
-        end_ip=end_ip,
-        subnet=subnet,
-        gateway=gateway,
-        dns=dns,
-        lease_file=lease_file,
-        static_leases=static_mappings,
-        next_server=next_server,
-        boot_file=boot_file,
-        custom_options=parsed_custom_options
+        interface_ip=server_ip, start_ip=start_ip, end_ip=end_ip, subnet=subnet,
+        gateway=gateway, dns=dns, lease_file=lease_file, static_leases=static_mappings,
+        next_server=next_server, boot_file=boot_file, custom_options=parsed_custom_options,
+        web_user=web_user, web_pass=web_pass
     )
     
     server.config_file = args.config
